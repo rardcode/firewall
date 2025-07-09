@@ -1,0 +1,15 @@
+
+# put in /etc/systemd/system/firewall.service
+
+[Unit]
+Description="Linux firewall based on nftables"
+After=network.target docker.service
+
+[Service]
+Type=simple
+ExecStart=/bin/bash /usr/local/bin/firewall start
+ExecStop=/bin/bash /usr/local/bin/firewall stop
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

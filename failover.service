@@ -1,0 +1,19 @@
+
+# put in /etc/systemd/system/failover.service
+
+[Unit]
+Description=Failover Multi WAN Monitor
+After=network.target docker.service
+
+[Service]
+Type=simple
+ExecStartPre=/bin/touch /run/failover_running
+ExecStart=/usr/local/bin/failover
+ExecStopPost=/bin/rm -f /run/failover_running
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

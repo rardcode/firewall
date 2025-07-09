@@ -1,0 +1,208 @@
+#!/bin/bash
+
+# Multi-WAN Failover Monitoring Script
+# Author: Gian Luca Vagnuzzi <vagnu00@gmx.com>
+# Revision: 25.09.2025
+
+
+
+
+fwlConfDir="/etc/firewall.d"
+source "$fwlConfDir/toFailoverEnvs.sh"
+
+CHECK_HOST="8.8.8.8"
+LOG_FILE="/var/log/failover.log"
+[ ! -e "$LOG_FILE" ] && touch "$LOG_FILE"
+[ ! -e /etc/iproute2 ] && mkdir /etc/iproute2
+[ -e /etc/iproute2/rt_tables ] && > /etc/iproute2/rt_tables
+
+[ -e "$customConfFile" ] && grep -e '^ *FORCE' -e '^ *WAN' "$customConfFile" > "$wanIfFile" && source "$wanIfFile"
+
+log() {
+    local LEVEL="$1"
+    local MSG="$2"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [$LEVEL] $MSG" | tee -a "$LOG_FILE"
+}
+
+interface_exists() {
+    ip link show "$1" > /dev/null 2>&1
+    return $?
+}
+
+check_gateway() {
+    local iface=$1
+    if ! interface_exists "$iface"; then
+        log "ERROR" "Interface $iface does not exist. Skipping gateway check."
+        return 1
+    fi
+    ping -I "$iface" -c 2 -W 2 "$CHECK_HOST" > /dev/null
+    return $?
+}
+
+route_exists() {
+    local gw="$1"
+    local iface="$2"
+    local metric="$3"
+
+    if [[ -z "$metric" ]]; then
+        ip route show default | grep -q "default via $gw dev $iface" && return 0
+    else
+        ip route show default | grep -q "default via $gw dev $iface metric $metric" && return 0
+    fi
+
+    return 1
+}
+
+ensure_default_route() {
+    # If no default route is found, add the highest-priority WAN as default
+    if ! ip route show default | grep -q '^default'; then
+        IFS='|' read -r ord iface gw <<< "${sorted[0]}"
+        if interface_exists "$iface"; then
+            log "WARN" "No default route found — forcing route via $gw ($iface)"
+            ip route add default via "$gw" dev "$iface"
+            CURRENT_GATEWAY="$gw"
+        else
+            log "ERROR" "Primary interface $iface not found. Cannot set default route."
+        fi
+    fi
+}
+
+cleanup_custom_ip_rules() {
+    ip rule show | grep -vE 'lookup (main|local|default)' | while read -r rule; do
+        prio=$(echo "$rule" | cut -d: -f1)
+        ip rule del priority "$prio"
+        log "INFO" "Deleted custom rule with priority $prio: $rule"
+    done
+}
+
+remove_all_default_gateways() {
+    while ip route show | grep -q '^default'; do
+        ip route show | grep '^default' | while read -r line; do
+            echo "Removing: $line"
+            ip route del $line
+        done
+        sleep 1
+    done
+    echo "All default gateways removed."
+}
+
+setup_forced_routes() {
+    local id_offset=200
+    local ip wan_label
+    local idx iface gw ord table_id table_name
+
+    declare -A WAN_INDEX_MAP
+    for i in "${!WAN[@]}"; do
+        WAN_INDEX_MAP["wan$((i))"]="$i"
+    done
+
+    for entry in $FORCE; do
+        IFS=',' read -r ip wan_label <<< "$entry"
+        idx="${WAN_INDEX_MAP[$wan_label]}"
+
+        if [[ -z "$idx" ]]; then
+            log "ERROR" "Invalid WAN label in FORCE: $wan_label"
+            continue
+        fi
+
+        IFS=',' read -r iface gw ord <<< "${WAN[$idx]}"
+
+        if ! interface_exists "$iface"; then
+            log "ERROR" "Interface $iface does not exist. Skipping forced route for $ip."
+            continue
+        fi
+
+        table_id=$(( id_offset + idx ))
+        table_name="force${idx}table"
+
+        if ! grep -q -E "^[[:space:]]*${table_id}[[:space:]]+${table_name}$" /etc/iproute2/rt_tables; then
+            echo "$table_id $table_name" >> /etc/iproute2/rt_tables
+            log "INFO" "Added routing table: $table_name ($table_id)"
+        fi
+
+        if ! ip route show table "$table_name" | grep -q "^default via $gw dev $iface"; then
+            ip route replace default via "$gw" dev "$iface" table "$table_name"
+            log "INFO" "Set default route in $table_name via $gw ($iface)"
+        fi
+
+        if ! ip rule show | grep -q "from $ip lookup $table_name"; then
+            ip rule add from "$ip" lookup "$table_name"
+            log "INFO" "Forced $ip to use $wan_label via $table_name"
+        fi
+    done
+}
+
+log "INFO" "Starting Multi-WAN failover script..."
+CURRENT_GATEWAY=""
+
+tmp_list=()
+for i in "${!WAN[@]}"; do
+    IFS=',' read -r iface gw ord <<< "${WAN[$i]}"
+    tmp_list+=("$ord|$iface|$gw")
+done
+
+IFS=$'\n' sorted=($(sort -n <<<"${tmp_list[*]}"))
+unset IFS
+
+cleanup_custom_ip_rules
+remove_all_default_gateways
+
+[[ -n "$FORCE" ]] && setup_forced_routes
+ensure_default_route
+
+while true; do
+    active_found=false
+
+    for entry in "${sorted[@]}"; do
+        IFS='|' read -r ord iface gw <<< "$entry"
+        metric=$(( ord * 100 ))
+
+        if ! interface_exists "$iface"; then
+            log "ERROR" "Interface $iface does not exist. Skipping."
+            continue
+        fi
+
+        if check_gateway "$iface"; then
+            if [[ "$CURRENT_GATEWAY" != "$gw" ]]; then
+                if ! route_exists "$gw" "$iface"; then
+                    log "INFO" "WAN OK — setting PRIMARY gateway on $gw ($iface)"
+                    ip route replace default via "$gw" dev "$iface"
+                else
+                    log "INFO" "Primary route already exists for $gw ($iface)"
+                fi
+                CURRENT_GATEWAY="$gw"
+            fi
+            active_found=true
+            break
+        fi
+    done
+
+    if $active_found; then
+        for entry in "${sorted[@]}"; do
+            IFS='|' read -r ord iface gw <<< "$entry"
+            metric=$(( ord * 100 ))
+
+            if [[ "$gw" != "$CURRENT_GATEWAY" ]]; then
+                if interface_exists "$iface" && ! route_exists "$gw" "$iface" "$metric"; then
+                    log "INFO" "Adding fallback route: $gw ($iface) with metric $metric"
+                    ip route replace default via "$gw" dev "$iface" metric "$metric"
+                fi
+            fi
+        done
+    else
+        log "ERROR" "ALL WANs are down! No active connections."
+        CURRENT_GATEWAY=""
+
+        for entry in "${sorted[@]}"; do
+            IFS='|' read -r ord iface gw <<< "$entry"
+            metric=$(( ord * 100 ))
+
+            if interface_exists "$iface" && ! route_exists "$gw" "$iface" "$metric"; then
+                log "INFO" "Setting fallback route: $gw ($iface) with metric $metric"
+                ip route replace default via "$gw" dev "$iface" metric "$metric" 2>> "$LOG_FILE"
+            fi
+        done
+    fi
+
+    sleep 10
+done

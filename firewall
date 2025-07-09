@@ -1,0 +1,423 @@
+#!/bin/bash
+
+# FireWall - Firewall cript based on nftables.
+# written by Gian Luca Vagnuzzi <vagnu00@gmx.com>
+#
+# rev. 29.09.2025
+
+#log() {
+#    local timestamp="[$(date '+%Y-%m-%d %H:%M:%S')]"
+#    local raw="$*"
+#    local clean=$(echo -e "$raw" | sed -E 's/\x1B\[[0-9;]*[JKmsu]//g' | tr -d '\n')
+#
+#    # Output colorato al terminale con timestamp
+#    echo -e "$timestamp $raw"
+#
+#    # Log pulito a syslog con timestamp
+#    logger -t firewall "$timestamp $clean"
+#}
+
+log() {
+    local timestamp="[$(date '+%Y-%m-%d %H:%M:%S')]"
+    local raw="$*"
+    local clean_lines
+
+    # Pulisce da codici ANSI (colori)
+    clean_lines=$(echo -e "$raw" | sed -E 's/\x1B\[[0-9;]*[JKmsu]//g')
+
+    # Stampa a schermo con colori
+    echo -e "$timestamp $raw"
+
+    # Logga ogni riga separatamente
+    while IFS= read -r line; do
+        logger -t firewall "$line"
+    done <<< "$clean_lines"
+}
+
+function chk_required_cmds {
+ # verify if all commands are installed in the system paths
+ for i in $@; do
+  which "$i" >/dev/null 2>&1
+  [ $? -ne 0 ] && echo "WARNING: the command '$i' doesn't exist in any path, please install it and retry!" && exit 1
+ done
+}
+
+function wait_if {
+ #[ ! -z $1 ] && until ip a | grep -m1 "$1" | grep "state UP" &>/dev/null; do sleep 1; done
+ if [[ -n "$1" ]]; then
+    attempt=0
+    max_attempts=1
+    until ip a | grep -m1 "$1" | grep "state UP" &>/dev/null; do
+        ((attempt++))
+        if (( attempt >= max_attempts )); then
+            log "\n ===>\e[31m Timeout: '$1' is DOWN or not present! \e[0m<===\n"
+            break
+        fi
+        sleep 1
+    done
+ fi
+
+}
+
+function ip_calc {
+ [ ! -z $1 ] && ip a | grep -m1 "$1"$ | awk '{print $2}' | cut -d / -f1
+}
+
+function lan_calc {
+ [ ! -z $1 ] && ipcalc $(ip a | grep -m1 "$1"$ | awk '{print $2}') | grep Network | awk '{print $2}'
+}
+
+function is_mac  {
+ local mac=$1
+ [[ $mac =~ ^([0-9a-fA-F]{2}[:-]){5}([0-9a-fA-F]{2})$ ]] && return 0 || return 1
+}
+
+function misc_settings {
+ # source LAN envs from customConfFile
+ [ -e $customConfFile ] && cat $customConfFile | grep '^ *LAN' > $lanIfFile && source $lanIfFile
+
+ # source WAN envs from customConfFile (ex. WAN[1]="eth1,192.168.1.254,2")
+ [ -e $customConfFile ] && cat $customConfFile | grep '^ *WAN' > $wanIfFile && source $wanIfFile
+ # extract WAN iface & gateway envs
+ declare -a GW
+ for i in "${!WAN[@]}"; do
+  IFS=',' read -r iface gw _ <<< "${WAN[$i]}"
+  WAN[$i]="$iface"
+  GW[$i]="$gw"
+ done
+
+ # if WAN1 env exist, set routerMode
+ [[ -n "${WAN[1]:-}" ]] && routerMode=1
+ # if WAN2 env exist, set failoverMode
+ [[ -n "${WAN[2]:-}" ]] && failoverMode=1
+
+ ## if docker service is enable check if it is active. If OK, prune unused networks & set ON dockerSvc env
+ if $(systemctl is-enabled -q docker); then
+  if $(systemctl is-active --quiet docker); then
+   docker network prune -f
+   log "\e[35m       -> Docker = \e[32mON \e[35m<- \e[0m"
+   dockerSvc=1
+  fi
+ fi
+
+ # if libvirtd is started, set libvirtdSvc env ON
+ [ -e /run/libvirt/libvirt-sock ] && libvirtdSvc=1
+ # if fail2ban is started, set fail2banSvc env ON
+ [ -e /run/fail2ban/fail2ban.sock ] && fail2banSvc=1
+
+ ## count interfaces & declare IP and SUBNET env
+ if [ $routerMode = 1 ]; then
+  log "\e[35m       -> Router mode = \e[32mON \e[35m<- \e[0m"
+
+  # calculation number of WAN interfaces
+  ifnr_wan="${#WAN[@]}"
+  # calculation number of LAN interfaces
+  ifnr_lan="${#LAN[@]}"
+
+ ## Address manage
+  [ -e $envFile ] && rm $envFile
+  for i in $(seq 1 $ifnr_lan); do
+   wait_if "${LAN[${i}]}"
+   echo "LAN[$i]=${LAN[${i}]}" >> $envFile
+   export LAN${i}_IP="$(ip_calc ${LAN[${i}]})"
+   declare -g NET_LAN[${i}]="$(lan_calc ${LAN[${i}]})"; echo "NET_LAN[$i]=${NET_LAN[${i}]}" >> $envFile
+   source $envFile
+  done
+
+  [ -e $envFile ] && rm $envFile
+  for i in $(seq 1 $ifnr_wan); do
+   wait_if "${WAN[${i}]}"
+   echo "WAN[$i]=${WAN[${i}]}" >> $envFile
+   export WAN${i}_IP="$(ip_calc ${WAN[${i}]})"
+   declare -g NET_WAN[${i}]="$(lan_calc ${WAN[${i}]})"; echo "NET_WAN[$i]=${NET_WAN[${i}]}" >> $envFile
+   source $envFile
+  done
+
+  ## make LAN to WAN lists for authorized devices
+  for i in $(seq 1 $ifnr_lan); do
+   [ ! -e $fwlConfDir/LAN${i}toWAN-DENY.txt ] && touch $fwlConfDir/LAN${i}toWAN-DENY.txt
+   [ ! -e $fwlConfDir/LAN${i}toWAN.txt ] && touch $fwlConfDir/LAN${i}toWAN.txt
+  done
+ else
+  log "\e[35m       -> Router mode = \e[33mOFF \e[35m<- \e[0m"
+ fi
+
+ # detect docker networks
+ if [ $dockerSvc = 1 ]; then
+  [ -e $dockerSubnet ] && rm $dockerSubnet
+  for net in $(docker network ls -f driver=bridge | tail -n +2 | awk '{print $2}'); do
+   docker network inspect $net | grep Subnet | awk -F ' ' '{print $2}' | cut -d , -f1 | sed 's/"//g' >> $dockerSubnet
+  done
+ fi
+
+ # detect libvirt networks
+ if [ $libvirtdSvc = 1 ]; then
+  log "\e[35m       -> Libvirtd = \e[32mON \e[35m<- \e[0m"
+  #log " => - LIBVIRTD subnet:"
+  _ip=$(cat /etc/libvirt/qemu/networks/default.xml | grep 'ip address' | awk -F 'address=' '{print $2}' | cut -d ' ' -f1 | sed "s/'//g")
+  _nmask=$(cat /etc/libvirt/qemu/networks/default.xml | grep 'ip address' | awk -F 'netmask=' '{print $2}' | cut -d '>' -f1  | sed "s/'//g")
+  libvirt_network=$(ipcalc $_ip $_nmask | grep ^Network | awk -F ' ' '{print $2}')
+  #log "\e[35m --->> $libvirt_network <<---\e[0m"
+ fi
+
+ # setup ipv4 parameters for routing
+ if [ $routerMode = 1 ]; then
+  echo -n '1' > /proc/sys/net/ipv4/ip_forward  # enable ip forwanding
+  echo -n '1' > /proc/sys/net/ipv4/icmp_echo_ignore_broadcasts # drop broadcast ping request
+  for i in $(seq 1 $ifnr_wan); do
+   [ -e /proc/sys/net/ipv4/conf/${WAN[${i}]}/rp_filter ] && echo -n '1' > /proc/sys/net/ipv4/conf/${WAN[${i}]}/rp_filter # drop spoofing
+  done
+ fi
+}
+
+function all_rules {
+ log " => - Creating new tables & chains..."
+ # ADD TABLES
+ nft add table inet table_filter
+ nft add table ip table_nat
+
+ # ADD CHAINS
+ nft add chain inet table_filter FIXED_RULES
+ nft add chain inet table_filter INPUT_CUSTOM
+ nft add chain inet table_filter OUTPUT_CUSTOM
+ nft add chain inet table_filter FORWARD_CUSTOM
+ nft add chain inet table_filter chain_input '{ type filter hook input priority filter ; }'
+ nft add chain inet table_filter chain_output '{ type filter hook output priority filter ; }'
+ nft add chain inet table_filter chain_forward '{ type filter hook forward priority filter ; }'
+ nft add chain ip table_nat chain_prerouting '{ type nat hook prerouting priority dstnat ; }'
+ nft add chain ip table_nat chain_postrouting '{ type nat hook postrouting priority srcnat ; }'
+ nft add chain ip table_nat PREROUTING_CUSTOM
+ nft add chain ip table_nat POSTROUTING_CUSTOM
+ [ $dockerSvc = 1 ] && nft add chain ip table_nat DOCKER
+ if [ $routerMode = 1 ]; then
+  for i in $(seq 1 $ifnr_lan); do
+   nft add chain inet table_filter INPUT_FROM_LAN$i
+   nft add chain inet table_filter WAN_FROM_LAN$i
+  done
+ fi
+ log " => - Preloading fixed rules..."
+ nft add rule inet table_filter FIXED_RULES ct state invalid drop
+ nft add rule inet table_filter FIXED_RULES ct state related,established accept
+ nft add rule inet table_filter FIXED_RULES pkttype multicast accept
+ nft add rule inet table_filter FIXED_RULES pkttype broadcast accept
+ nft add rule inet table_filter FIXED_RULES icmp   type echo-reply              limit rate 2/second burst 5 packets accept
+ nft add rule inet table_filter FIXED_RULES icmp   type destination-unreachable limit rate 2/second burst 5 packets accept
+ nft add rule inet table_filter FIXED_RULES icmp   type time-exceeded           limit rate 2/second burst 5 packets accept
+ nft add rule inet table_filter FIXED_RULES icmpv6 type destination-unreachable limit rate 2/second burst 5 packets accept
+ nft add rule inet table_filter FIXED_RULES icmpv6 type packet-too-big          limit rate 2/second burst 5 packets accept
+ nft add rule inet table_filter FIXED_RULES icmpv6 type time-exceeded           limit rate 2/second burst 5 packets accept
+ nft add rule inet table_filter FIXED_RULES icmpv6 type parameter-problem       limit rate 2/second burst 5 packets accept
+ nft add rule inet table_filter FIXED_RULES icmpv6 type echo-reply              limit rate 2/second burst 5 packets accept
+ nft add rule inet table_filter FIXED_RULES icmpv6 type mld-listener-query      limit rate 2/second burst 5 packets accept
+ nft add rule inet table_filter FIXED_RULES icmpv6 type mld-listener-report     limit rate 2/second burst 5 packets accept
+ nft add rule inet table_filter FIXED_RULES icmpv6 type mld-listener-done       limit rate 2/second burst 5 packets accept
+ nft add rule inet table_filter FIXED_RULES icmpv6 type mld-listener-reduction  limit rate 2/second burst 5 packets accept
+ nft add rule inet table_filter FIXED_RULES icmpv6 type nd-router-solicit       limit rate 2/second burst 5 packets accept
+ nft add rule inet table_filter FIXED_RULES icmpv6 type nd-router-advert        limit rate 2/second burst 5 packets accept
+ nft add rule inet table_filter FIXED_RULES icmpv6 type nd-neighbor-solicit     limit rate 2/second burst 5 packets accept
+ nft add rule inet table_filter FIXED_RULES icmpv6 type nd-neighbor-advert      limit rate 2/second burst 5 packets accept
+ nft add rule inet table_filter FIXED_RULES icmpv6 type nd-redirect             limit rate 2/second burst 5 packets accept
+ nft add rule inet table_filter FIXED_RULES icmpv6 type router-renumbering      limit rate 2/second burst 5 packets accept
+ nft add rule inet table_filter FIXED_RULES icmpv6 type mld2-listener-report    limit rate 2/second burst 5 packets accept
+
+ log " => - Preloading extra rules..."
+
+ # deny & allow txt files in /etc/firewall.d
+ for i in $(seq 1 $ifnr_lan); do
+  if [ -s $fwlConfDir/LAN${i}toWAN-DENY.txt ]; then
+   cat "$fwlConfDir/LAN${i}toWAN-DENY.txt" | grep -v "^#" | grep -v "^$" | while read line; do
+    line_addr=$(echo $line | awk '{print $1}')
+    line_desc=$(echo $line | awk '{ $1=""; print}')
+    is_mac "$line_addr" && ruleAddrType="ether" ruleDesc="MAC" || ruleAddrType="ip" ruleDesc="IP"
+    nft add rule inet table_filter WAN_FROM_LAN$i $ruleAddrType saddr "$line_addr" drop
+    [ $? = 0 ] && echo "Added $ruleDesc:[$line_addr] Desc:[$line_desc] to LAN${i}toWAN-DENY" || echo "Error with adding $ruleDesc:[$line_addr] Desc:[$line_desc] to LAN${i}toWAN-DENY"
+   done
+  fi
+
+  if [ -s $fwlConfDir/LAN${i}toWAN.txt ]; then
+   cat "$fwlConfDir/LAN${i}toWAN.txt" | grep -v "^#" | grep -v "^$" | while read line; do
+    line_addr=$(echo $line | awk '{print $1}')
+    line_desc=$(echo $line | awk '{ $1=""; print}')
+    is_mac "$line_addr" && ruleAddrType="ether" ruleDesc="MAC" || ruleAddrType="ip" ruleDesc="IP"
+    nft add rule inet table_filter WAN_FROM_LAN$i $ruleAddrType saddr "$line_addr" accept
+    [ $? = 0 ] && echo "Added $ruleDesc:[$line_addr] Desc:[$line_desc] to LAN${i}toWAN" || echo "Error with adding $ruleDesc:[$line_addr] Desc:[$line_desc] to LAN${i}toWAN"
+   done
+  fi
+ done
+
+ # customConfFile rules
+ [ -e $customConfFile ] && cat $customConfFile | grep -v -e '^ *FORCE' -e '^ *LAN' -e '^ *WAN' > /tmp/nolanwanfile && source /tmp/nolanwanfile >> $tmpNewRulesFile
+ #echo -e '\e[93m'; cat $tmpNewRulesFile | grep -v 'new generation'; echo -e '\e[0m'
+ log "\n\e[93m$(grep -v 'new generation' "$tmpNewRulesFile")\e[0m"
+
+ # docker rules
+ if  [ $dockerSvc = 1 ]; then
+  nft add rule ip table_nat PREROUTING_CUSTOM fib daddr type local jump DOCKER
+  for net in $(cat $dockerSubnet); do
+   nft add rule inet table_filter INPUT_CUSTOM ip saddr $net ct state new accept
+   nft add rule inet table_filter FORWARD_CUSTOM ip saddr $net ct state new accept
+   nft add rule inet table_filter FORWARD_CUSTOM ip daddr $net ct state new accept
+   nft add rule ip table_nat POSTROUTING_CUSTOM oifname != "docker0" ip saddr $net masquerade
+  done
+ fi
+
+ # libvirtd rules
+ if [ $libvirtdSvc = 1 ]; then
+  nft add rule inet table_filter INPUT_CUSTOM ip saddr $libvirt_network ct state new accept
+  nft add rule inet table_filter FORWARD_CUSTOM ip saddr $libvirt_network ct state new accept
+ fi
+
+ # router rules
+ if [ $routerMode = 1 ]; then
+  for l in $(seq 1 $ifnr_lan); do
+   nft add rule inet table_filter INPUT_CUSTOM iifname ${LAN[$l]} ip saddr ${NET_LAN[$l]} jump INPUT_FROM_LAN$l
+   for w in $(seq 1 $ifnr_wan); do
+    nft add rule inet table_filter FORWARD_CUSTOM iifname ${LAN[$l]} ip saddr ${NET_LAN[$l]} oifname ${WAN[${w}]} jump WAN_FROM_LAN$l
+   done
+  done
+   for i in $(seq 1 $ifnr_wan); do
+    iface="${WAN[$i]}"
+    eval "wan_ip=\"\$WAN${i}_IP\""
+    [ ! -z "$wan_ip" ] && nft add rule ip table_nat POSTROUTING_CUSTOM oifname "$iface" snat to "$wan_ip"
+   done
+ fi
+
+ log " => - Loading PREROUTING rules..."
+ nft insert rule ip table_nat chain_prerouting jump PREROUTING_CUSTOM
+
+ log " => - Loading INPUT rules..."
+ nft add rule inet table_filter chain_input iifname "lo" accept
+ nft add rule inet table_filter chain_input jump FIXED_RULES
+ nft add rule inet table_filter chain_input jump INPUT_CUSTOM
+ nft add rule inet table_filter chain_input log prefix \"INPUT DROP: \" drop
+
+ log " => - Loading OUTPUT rules..."
+ nft add rule inet table_filter chain_output oifname "lo" accept
+ nft add rule inet table_filter chain_output jump FIXED_RULES
+ nft add rule inet table_filter chain_output jump OUTPUT_CUSTOM
+ nft add rule inet table_filter chain_output ct state new accept
+ nft add rule inet table_filter chain_output log prefix \"OUTPUT DROP: \" drop
+
+ log " => - Loading FORWARD rules..."
+ nft add rule inet table_filter chain_forward jump FIXED_RULES
+ nft add rule inet table_filter chain_forward jump FORWARD_CUSTOM
+ nft add rule inet table_filter chain_forward log prefix \"FORWARD DROP: \" drop
+
+ log " => - Loading POSTROUTING rules..."
+ nft insert rule ip table_nat chain_postrouting jump POSTROUTING_CUSTOM
+
+ if [ $routerMode = 1 ]; then
+  log " => - Add gateway routes..."
+  [ $failoverMode = 1 ] && systemctl restart failover || ip route replace default via "${GW[1]}" dev "${WAN[1]}"
+ fi
+}
+
+function iptablesFlush {
+ iptables -F
+ iptables -X
+ iptables -Z
+ iptables -t nat -F
+ iptables -t nat -X
+ iptables -t mangle -F
+ iptables -t raw -F
+ ip6tables -F
+ ip6tables -X
+ ip6tables -Z
+ ip6tables -t nat -F
+ ip6tables -t mangle -F
+ ip6tables -t raw -F
+}
+
+function fw_start {
+ log "\n ===> -\e[33m FireWall STARTING:\e[0m"
+ log " ==> - Cleaning old rules..."
+ nft flush ruleset
+ iptablesFlush
+ log " ==> - Misc setup: ip & subnet address calc, envs, ipv4 routing..."
+ misc_settings
+ log " ==> - \e[33mSTART LOADING RULES\e[0m"
+ all_rules
+ log " ==> - \e[33mEND LOADING RULES\e[0m"
+ log " ==> - Cleaning up established connections table..."
+ conntrack --flush 2>/dev/null && sleep 1
+ [ $libvirtdSvc = 1 ] && log " ==> - Restarting libvirtd service..." && systemctl restart libvirtd
+ [ $fail2banSvc = 1 ] && log " ==> - Restarting Fail2ban service..." && systemctl restart fail2ban
+ #[ $dockerSvc = 1 ]   && log " ==> - Restarting docker service..."   && systemctl restart docker
+ log " ===> -\e[32m *** FireWall STARTED ***\e[0m\n"
+ exit 0
+}
+
+function fw_stop {
+ log "\n ==> -\e[31m FireWall STOPPING...\e[0m"
+ log " ==> - Cleaning old rules..."
+ nft flush ruleset
+ iptablesFlush
+ log " ==> - Cleaning up established connections table..."
+ conntrack --flush 2>/dev/null && sleep 1
+ log " ===> - \e[33m!!! FireWall STOPPED !!!\e[0m\n"
+ exit 0
+}
+
+# vars
+################
+requiredCmds="ipcalc conntrack"
+tempdir=$(mktemp -d) && trap "rm -rf "$tempdir"" 0 || exit
+tmpNewRulesFile="$tempdir/firewallNewRules.tmp"
+tmpIfnrFile="$tempdir/ifnr.tmp"
+fwlConfDir="/etc/firewall.d"
+customConfFile="$fwlConfDir/customRules.sh"
+fwlVarConfDir="/var/lib/firewall"
+lanIfFile="$fwlVarConfDir/lanIfFile.sh"
+wanIfFile="$fwlVarConfDir/wanIfFile.sh"
+envFile="$fwlVarConfDir/vars.sh"
+toFailoverEnvs="$fwlVarConfDir/toFailoverEnvs.sh"
+logFile="/var/log/firewall.log"
+dockerSubnet="$fwlVarConfDir/docker-subnet"
+: ${routerMode=0}
+: ${failoverMode=0}
+: ${dockerSvc=0}
+: ${libvirtdSvc=0}
+: ${fail2banSvc=0}
+[ ! -e $fwlConfDir ] && mkdir $fwlConfDir
+[ ! -e $fwlVarConfDir ] && mkdir $fwlVarConfDir
+[ ! -e $customConfFile ] && touch $customConfFile
+_PROG=$( echo ${0##*/} )
+
+# send envs to failover envs file
+echo "customConfFile="$customConfFile"" > $toFailoverEnvs
+echo "wanIfFile="$wanIfFile"" >> $toFailoverEnvs
+echo "logFile="$logFile"" >> $toFailoverEnvs
+
+chk_required_cmds ${requiredCmds}
+
+case $1 in
+ start|restart)
+  #echo "$(date) - fwl start" >> /var/log/fwl-start.log
+  fw_start
+ ;;
+
+ stop)
+  fw_stop
+ ;;
+
+ show)
+ nft --handle list ruleset
+ ;;
+
+ edit)
+ $EDITOR $0
+ ;;
+
+ rules)
+ $EDITOR $customConfFile
+ ;;
+
+ log)
+  tail -f $logFile
+ ;;
+
+ *)
+  echo "Usage: $_PROG start|restart|stop|show|edit|rules|log"
+ ;;
+esac
+
