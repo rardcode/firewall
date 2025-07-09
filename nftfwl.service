@@ -1,0 +1,12 @@
+[Unit]
+After=multi-user.target docker.service
+Description="nftfwl - Linux firewall based on nftables"
+
+[Service]
+Type=simple
+ExecStart=/bin/bash /usr/local/bin/nftfwl start
+ExecStop=/bin/bash /usr/local/bin/nftfwl stop
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

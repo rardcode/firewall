@@ -1,0 +1,334 @@
+#!/bin/bash
+
+# Firewall script based on nftables.
+# written by Gian Luca Vagnuzzi <vagnu00@gmx.com>
+#
+# rev. 06.07.2025
+
+function chk_required_cmds {
+ # verify if all commands are installed in the system paths
+ for i in $@; do
+  which "$i" >/dev/null 2>&1
+  [ $? -ne 0 ] && echo "WARNING: the command '$i' doesn't exist in any path, please install it and retry!" && exit 1
+ done
+}
+
+function wait_if {
+ [ ! -z $1 ] && until ip a | grep -m1 "$1" | grep "state UP" &>/dev/null; do sleep 1; done
+}
+
+function ip_calc {
+ [ ! -z $1 ] && ip a | grep -m1 "$1"$ | awk '{print $2}' | cut -d / -f1
+}
+
+function lan_calc {
+ [ ! -z $1 ] && ipcalc $(ip a | grep -m1 "$1"$ | awk '{print $2}') | grep Network | awk '{print $2}'
+}
+
+function is_mac  {
+ local mac=$1
+ [[ $mac =~ ^([0-9a-fA-F]{2}[:-]){5}([0-9a-fA-F]{2})$ ]] && return 0 || return 1
+}
+
+function misc_settings {
+ # source env from customConfFile
+ [ -e $customConfFile ] && cat $customConfFile | grep '^ *ETH' > $ifFile && source $ifFile
+ # if ETH envs exists, set routerMode
+ [ ${#ETH[@]} != 0 ] && routerMode=1
+
+ ## if docker service is enable check if it is active. If OK, prune unused networks & set ON dockerSvc env
+ if $(systemctl is-enabled -q docker); then
+  if $(systemctl is-active --quiet docker); then
+   docker network prune -f
+   echo -e "\e[35m       -> Docker = \e[32mON \e[35m<- \e[0m"
+   dockerSvc=1
+  fi
+ fi
+
+ # if libvirtd is started, set libvirtdSvc env ON
+ [ -e /run/libvirt/libvirt-sock ] && libvirtdSvc=1
+ # if fail2ban is started, set fail2banSvc env ON
+ [ -e /run/fail2ban/fail2ban.sock ] && fail2banSvc=1
+
+ ## count interfaces & declare IP and SUBNET env
+ if [ $routerMode = 1 ]; then
+  echo -e "\e[35m       -> Router mode = \e[32mON \e[35m<- \e[0m"
+  #for ifnr in "${ETH[@]}"; do echo $ifnr >> $tmpIfnrFile; done
+  # calculation number of all interfaces
+  #ifnr=$(wc -l $tmpIfnrFile | cut -d ' ' -f1)
+  ifnr="${#ETH[@]}"
+  # calculation number of lan interfaces
+  ifnr_lan=$((ifnr-1))
+
+ ## Address manage
+  [ -e $envFile ] && rm $envFile
+  for i in $(seq 0 $ifnr_lan); do
+   wait_if "${ETH[${i}]}"
+   echo "ETH[$i]=${ETH[${i}]}" >> $envFile
+   export ETH${i}_IP="$(ip_calc ${ETH[${i}]})"
+   declare -g LAN_ETH[${i}]="$(lan_calc ${ETH[${i}]})"; echo "LAN_ETH[$i]=${LAN_ETH[${i}]}" >> $envFile
+   source $envFile
+  done
+
+  ## make LAN to WAN lists for authorized devices
+  for i in $(seq 1 $ifnr_lan); do
+   [ ! -e $nftConfDir/LAN${i}toWAN-DENY.txt ] && touch $nftConfDir/LAN${i}toWAN-DENY.txt
+   [ ! -e $nftConfDir/LAN${i}toWAN.txt ] && touch $nftConfDir/LAN${i}toWAN.txt
+  done
+ else
+  echo -e "\e[35m       -> Router mode = \e[33mOFF \e[35m<- \e[0m"
+ fi
+
+ # detect docker networks
+ if [ $dockerSvc = 1 ]; then
+  [ -e $dockerSubnet ] && rm $dockerSubnet
+  for net in $(docker network ls -f driver=bridge | tail -n +2 | awk '{print $2}'); do
+   docker network inspect $net | grep Subnet | awk -F ' ' '{print $2}' | cut -d , -f1 | sed 's/"//g' >> $dockerSubnet
+  done
+ fi
+
+ # detect libvirt networks
+ if [ $libvirtdSvc = 1 ]; then
+  echo -e "\e[35m       -> Libvirtd = \e[32mON \e[35m<- \e[0m"
+  #echo -e " => - LIBVIRTD subnet:"
+  _ip=$(cat /etc/libvirt/qemu/networks/default.xml | grep 'ip address' | awk -F 'address=' '{print $2}' | cut -d ' ' -f1 | sed "s/'//g")
+  _nmask=$(cat /etc/libvirt/qemu/networks/default.xml | grep 'ip address' | awk -F 'netmask=' '{print $2}' | cut -d '>' -f1  | sed "s/'//g")
+  libvirt_network=$(ipcalc $_ip $_nmask | grep ^Network | awk -F ' ' '{print $2}')
+  #echo -e "\e[35m --->> $libvirt_network <<---\e[0m"
+ fi
+
+ # setup ipv4 parameters for routing
+ [ $routerMode = 1 ] && echo -n '1' > /proc/sys/net/ipv4/ip_forward  # enable ip forwanding
+ [ $routerMode = 1 ] && echo -n '1' > /proc/sys/net/ipv4/icmp_echo_ignore_broadcasts # drop broadcast ping request
+ [ $routerMode = 1 ] && echo -n '1' > /proc/sys/net/ipv4/conf/${ETH[0]}/rp_filter # drop spoofing
+}
+
+function all_rules {
+ echo -e " => - Creating new tables & chains..."
+ # ADD TABLES
+ nft add table inet table_filter
+ nft add table ip table_nat
+
+ # ADD CHAINS
+ nft add chain inet table_filter FIXED_RULES
+ nft add chain inet table_filter INPUT_CUSTOM
+ nft add chain inet table_filter OUTPUT_CUSTOM
+ nft add chain inet table_filter FORWARD_CUSTOM
+ nft add chain inet table_filter chain_input '{ type filter hook input priority filter ; }'
+ nft add chain inet table_filter chain_output '{ type filter hook output priority filter ; }'
+ nft add chain inet table_filter chain_forward '{ type filter hook forward priority filter ; }'
+ nft add chain ip table_nat chain_prerouting '{ type nat hook prerouting priority dstnat ; }'
+ nft add chain ip table_nat chain_postrouting '{ type nat hook postrouting priority srcnat ; }'
+ nft add chain ip table_nat PREROUTING_CUSTOM
+ nft add chain ip table_nat POSTROUTING_CUSTOM
+ [ $dockerSvc = 1 ] && nft add chain ip table_nat DOCKER
+ if [ $routerMode = 1 ]; then
+  for i in $(seq 1 $ifnr_lan); do
+   nft add chain inet table_filter INPUT_FROM_LAN$i
+   nft add chain inet table_filter WAN_FROM_LAN$i
+  done
+ fi
+ echo -e " => - Preloading fixed rules..."
+ nft add rule inet table_filter FIXED_RULES ct state invalid drop
+ nft add rule inet table_filter FIXED_RULES ct state related,established accept
+ nft add rule inet table_filter FIXED_RULES pkttype multicast accept
+ nft add rule inet table_filter FIXED_RULES pkttype broadcast accept
+ nft add rule inet table_filter FIXED_RULES icmp   type echo-reply              limit rate 2/second burst 5 packets accept
+ nft add rule inet table_filter FIXED_RULES icmp   type destination-unreachable limit rate 2/second burst 5 packets accept
+ nft add rule inet table_filter FIXED_RULES icmp   type time-exceeded           limit rate 2/second burst 5 packets accept
+ nft add rule inet table_filter FIXED_RULES icmpv6 type destination-unreachable limit rate 2/second burst 5 packets accept
+ nft add rule inet table_filter FIXED_RULES icmpv6 type packet-too-big          limit rate 2/second burst 5 packets accept
+ nft add rule inet table_filter FIXED_RULES icmpv6 type time-exceeded           limit rate 2/second burst 5 packets accept
+ nft add rule inet table_filter FIXED_RULES icmpv6 type parameter-problem       limit rate 2/second burst 5 packets accept
+ nft add rule inet table_filter FIXED_RULES icmpv6 type echo-reply              limit rate 2/second burst 5 packets accept
+ nft add rule inet table_filter FIXED_RULES icmpv6 type mld-listener-query      limit rate 2/second burst 5 packets accept
+ nft add rule inet table_filter FIXED_RULES icmpv6 type mld-listener-report     limit rate 2/second burst 5 packets accept
+ nft add rule inet table_filter FIXED_RULES icmpv6 type mld-listener-done       limit rate 2/second burst 5 packets accept
+ nft add rule inet table_filter FIXED_RULES icmpv6 type mld-listener-reduction  limit rate 2/second burst 5 packets accept
+ nft add rule inet table_filter FIXED_RULES icmpv6 type nd-router-solicit       limit rate 2/second burst 5 packets accept
+ nft add rule inet table_filter FIXED_RULES icmpv6 type nd-router-advert        limit rate 2/second burst 5 packets accept
+ nft add rule inet table_filter FIXED_RULES icmpv6 type nd-neighbor-solicit     limit rate 2/second burst 5 packets accept
+ nft add rule inet table_filter FIXED_RULES icmpv6 type nd-neighbor-advert      limit rate 2/second burst 5 packets accept
+ nft add rule inet table_filter FIXED_RULES icmpv6 type nd-redirect             limit rate 2/second burst 5 packets accept
+ nft add rule inet table_filter FIXED_RULES icmpv6 type router-renumbering      limit rate 2/second burst 5 packets accept
+ nft add rule inet table_filter FIXED_RULES icmpv6 type mld2-listener-report    limit rate 2/second burst 5 packets accept
+
+ echo -e " => - Preloading extra rules..."
+
+ # deny & allow txt files in /etc/nftfwl.d
+ for i in $(seq 1 $ifnr_lan); do
+  if [ -s $nftConfDir/LAN${i}toWAN-DENY.txt ]; then
+   cat "$nftConfDir/LAN${i}toWAN-DENY.txt" | grep -v "^#" | grep -v "^$" | while read line; do
+    line_addr=$(echo $line | awk '{print $1}')
+    line_desc=$(echo $line | awk '{ $1=""; print}')
+    is_mac "$line_addr" && ruleAddrType="ether" ruleDesc="MAC" || ruleAddrType="ip" ruleDesc="IP"
+    nft add rule inet table_filter WAN_FROM_LAN$i $ruleAddrType saddr "$line_addr" drop
+    [ $? = 0 ] && echo "Added $ruleDesc:[$line_addr] Desc:[$line_desc] to LAN${i}toWAN-DENY" || echo "Error with adding $ruleDesc:[$line_addr] Desc:[$line_desc] to LAN${i}toWAN-DENY"
+   done
+  fi
+
+  if [ -s $nftConfDir/LAN${i}toWAN.txt ]; then
+   cat "$nftConfDir/LAN${i}toWAN.txt" | grep -v "^#" | grep -v "^$" | while read line; do
+    line_addr=$(echo $line | awk '{print $1}')
+    line_desc=$(echo $line | awk '{ $1=""; print}')
+    is_mac "$line_addr" && ruleAddrType="ether" ruleDesc="MAC" || ruleAddrType="ip" ruleDesc="IP"
+    nft add rule inet table_filter WAN_FROM_LAN$i $ruleAddrType saddr "$line_addr" accept
+    [ $? = 0 ] && echo "Added $ruleDesc:[$line_addr] Desc:[$line_desc] to LAN${i}toWAN" || echo "Error with adding $ruleDesc:[$line_addr] Desc:[$line_desc] to LAN${i}toWAN"
+   done
+  fi
+ done
+
+ # customConfFile rules
+ [ -e $customConfFile ] && source $customConfFile >> $tmpNewRulesFile
+ echo -e '\e[93m'; cat $tmpNewRulesFile | grep -v 'new generation'; echo -e '\e[0m'
+
+ # docker rules
+ if  [ $dockerSvc = 1 ]; then
+  nft add rule ip table_nat PREROUTING_CUSTOM fib daddr type local jump DOCKER
+  for net in $(cat $dockerSubnet); do
+   nft add rule inet table_filter INPUT_CUSTOM ip saddr $net ct state new accept
+   nft add rule inet table_filter FORWARD_CUSTOM ip saddr $net ct state new accept
+   nft add rule inet table_filter FORWARD_CUSTOM ip daddr $net ct state new accept
+   nft add rule ip table_nat POSTROUTING_CUSTOM oifname != "docker0" ip saddr $net masquerade
+  done
+ fi
+
+ # libvirtd rules
+ if [ $libvirtdSvc = 1 ]; then
+  nft add rule inet table_filter INPUT_CUSTOM ip saddr $libvirt_network ct state new accept
+  nft add rule inet table_filter FORWARD_CUSTOM ip saddr $libvirt_network ct state new accept
+  #nft add rule ip table_nat POSTROUTING_CUSTOM oifname != "virbr0" ip saddr $libvirt_network masquerade
+ fi
+
+ # router rules
+ if [ $routerMode = 1 ]; then
+  for i in $(seq 1 $ifnr_lan); do
+   nft add rule inet table_filter INPUT_CUSTOM iifname ${ETH[$i]} ip saddr ${LAN_ETH[$i]} jump INPUT_FROM_LAN$i
+   nft add rule inet table_filter FORWARD_CUSTOM iifname ${ETH[$i]} ip saddr ${LAN_ETH[$i]} oifname ${ETH[0]} jump WAN_FROM_LAN$i
+  done
+   nft add rule ip table_nat POSTROUTING_CUSTOM oifname "${ETH[0]}" snat to "${ETH0_IP}"
+ fi
+
+ echo -e " => - Loading PREROUTING rules..."
+ nft insert rule ip table_nat chain_prerouting jump PREROUTING_CUSTOM
+
+ echo -e " => - Loading INPUT rules..."
+ nft add rule inet table_filter chain_input iifname "lo" accept
+ nft add rule inet table_filter chain_input jump FIXED_RULES
+ nft add rule inet table_filter chain_input jump INPUT_CUSTOM
+ nft add rule inet table_filter chain_input log prefix \"INPUT DROP: \" drop
+
+ echo -e " => - Loading OUTPUT rules..."
+ nft add rule inet table_filter chain_output oifname "lo" accept
+ nft add rule inet table_filter chain_output jump FIXED_RULES
+ nft add rule inet table_filter chain_output jump OUTPUT_CUSTOM
+ nft add rule inet table_filter chain_output ct state new accept
+ nft add rule inet table_filter chain_output log prefix \"OUTPUT DROP: \" drop
+
+ echo -e " => - Loading FORWARD rules..."
+ nft add rule inet table_filter chain_forward jump FIXED_RULES
+ nft add rule inet table_filter chain_forward jump FORWARD_CUSTOM
+ nft add rule inet table_filter chain_forward log prefix \"FORWARD DROP: \" drop
+
+ echo -e " => - Loading POSTROUTING rules..."
+ nft insert rule ip table_nat chain_postrouting jump POSTROUTING_CUSTOM
+}
+
+function iptablesFlush {
+ iptables -F
+ iptables -X
+ iptables -Z
+ iptables -t nat -F
+ iptables -t nat -X
+ iptables -t mangle -F
+ iptables -t raw -F
+ ip6tables -F
+ ip6tables -X
+ ip6tables -Z
+ ip6tables -t nat -F
+ ip6tables -t mangle -F
+ ip6tables -t raw -F
+}
+
+function fw_start {
+ echo -e "\n ===> -\e[33m NftFwl STARTING:\e[0m"
+ echo -e " ==> - Cleaning old rules..."
+ nft flush ruleset
+ iptablesFlush
+ echo -e " ==> - Misc setup: ip & subnet address calc, envs, ipv4 routing..."
+ misc_settings
+ echo -e " ==> - \e[33mSTART LOADING RULES\e[0m"
+ all_rules
+ echo -e " ==> - \e[33mEND LOADING RULES\e[0m"
+ echo -e " ==> - Cleaning up established connections table..."
+ conntrack --flush 2>/dev/null && sleep 1
+ [ $libvirtdSvc = 1 ] && echo -e " ==> - Restarting libvirtd service..." && systemctl restart libvirtd
+ [ $fail2banSvc = 1 ] && echo -e " ==> - Restarting Fail2ban service..." && systemctl restart fail2ban
+ #[ $dockerSvc = 1 ]   && echo -e " ==> - Restarting docker service..."   && systemctl restart docker
+ echo -e " ===> -\e[32m *** NftFwl STARTED ***\e[0m\n"
+ exit 0
+}
+
+function fw_stop {
+ echo -e "\n ==> -\e[31m NftFwl STOPPING...\e[0m"
+ echo -e " ==> - Cleaning old rules..."
+ nft flush ruleset
+ iptablesFlush
+ echo -e " ==> - Cleaning up established connections table..."
+ conntrack --flush 2>/dev/null && sleep 1
+ echo -e " ===> - \e[33m!!! NftFwl STOPPED !!!\e[0m\n"
+ exit 0
+}
+
+# vars
+################
+requiredCmds="ipcalc conntrack"
+tempdir=$(mktemp -d) && trap "rm -rf "$tempdir"" 0 || exit
+tmpNewRulesFile="$tempdir/nftfwlNewRules.tmp"
+tmpIfnrFile="$tempdir/ifnr.tmp"
+nftConfDir="/etc/nftfwl.d"
+customConfFile="$nftConfDir/customRules.sh"
+ifFile="$nftConfDir/interfaces.sh"
+envFile="$nftConfDir/vars.sh"
+logFile="/var/log/nftables.log"
+dockerSubnet="/etc/docker/subnet"
+: ${routerMode=0}
+: ${dockerSvc=0}
+: ${libvirtdSvc=0}
+: ${fail2banSvc=0}
+[ ! -e $nftConfDir ] && mkdir $nftConfDir
+[ ! -e $customConfFile ] && touch $customConfFile
+_PROG=$( echo ${0##*/} )
+
+chk_required_cmds ${requiredCmds}
+
+case $1 in
+ start|restart)
+  echo "$(date) - fwl start" >> /var/log/fwl-start.log
+  fw_start
+ ;;
+
+ stop)
+  fw_stop
+ ;;
+
+ show)
+ nft --handle list ruleset
+ ;;
+
+ edit)
+ $EDITOR $0
+ ;;
+
+ rules)
+ $EDITOR $customConfFile
+ ;;
+
+ log)
+  tail -f $logFile
+ ;;
+
+ *)
+  echo "Usage: $_PROG start|restart|stop|show|edit|rules|log"
+ ;;
+esac
