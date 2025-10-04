@@ -5,18 +5,6 @@
 #
 # rev. 29.09.2025
 
-#log() {
-#    local timestamp="[$(date '+%Y-%m-%d %H:%M:%S')]"
-#    local raw="$*"
-#    local clean=$(echo -e "$raw" | sed -E 's/\x1B\[[0-9;]*[JKmsu]//g' | tr -d '\n')
-#
-#    # Output colorato al terminale con timestamp
-#    echo -e "$timestamp $raw"
-#
-#    # Log pulito a syslog con timestamp
-#    logger -t firewall "$timestamp $clean"
-#}
-
 log() {
     local timestamp="[$(date '+%Y-%m-%d %H:%M:%S')]"
     local raw="$*"

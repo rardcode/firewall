@@ -8,7 +8,8 @@ After=network.target docker.service
 [Service]
 Type=simple
 ExecStartPre=/bin/touch /run/failover_running
-ExecStart=/usr/local/bin/failover
+#ExecStart=/usr/local/bin/failover
+ExecStart=/usr/local/bin/checkwan
 ExecStopPost=/bin/rm -f /run/failover_running
 Restart=always
 RestartSec=5

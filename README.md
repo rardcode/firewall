@@ -76,8 +76,8 @@ ln -s /opt/firewall/firewall.service /etc/systemd/system/
 ln -s /opt/firewall/failover.service /etc/systemd/system/
 ln -s /opt/firewall/firewall /usr/local/bin/
 ln -s /opt/firewall/failover /usr/local/bin/
-cd /opt/firewall
-cp customRules.sh /etc/firewall.d/
+ln -s /opt/firewall/checkwan /usr/local/bin/
+cp /opt/firewall/customRules.sh /etc/firewall.d/
 ```
 
 Enable & start:

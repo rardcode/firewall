@@ -1,0 +1,98 @@
+#!/bin/bash
+
+# Continuous multi-WAN check script for failover
+# written by Gian Luca Vagnuzzi <vagnu00@gmx.com>
+# Checks reachability on each WAN using a targeted temporary route
+# When the primary WAN changes, it calls the failover script to update routes
+#
+# rev. 29.09.2025
+
+fwlVarConfDir="/var/lib/firewall"
+source "$fwlVarConfDir/toFailoverEnvs.sh"
+[ -e "$customConfFile" ] && grep -e '^ *FORCE' -e '^ *WAN' "$customConfFile" > /tmp/wanIfFile && source /tmp/wanIfFile
+
+FAILOVER_SCRIPT="/usr/local/bin/failover"
+CHECK_HOST="8.8.8.8"
+WAN_STATUS_FILE="/tmp/wan_status.txt"
+
+log() {
+    local timestamp="[$(date '+%Y-%m-%d %H:%M:%S')]"
+    local raw="$*"
+    local clean=$(echo -e "$raw" | sed -E 's/\x1B\[[0-9;]*[JKmsu]//g' | tr -d '\n')
+
+    # Colored output to terminal with timestamp
+    echo -e "$timestamp [checkwan] $raw"
+
+    # Clean log to syslog with timestamp
+    logger -t firewall "[checkwan] $clean"
+}
+
+check_wan() {
+    local iface=$1
+    local gw=$2
+
+    # Add temporary route for the check
+    ip route add $CHECK_HOST via "$gw" dev "$iface" metric 5000 2>/dev/null
+    ping -c 2 -W 2 -I "$iface" "$CHECK_HOST" > /dev/null 2>&1
+    local ret=$?
+    ip route del $CHECK_HOST via "$gw" dev "$iface" 2>/dev/null
+
+    return $ret
+}
+
+write_wan_status() {
+    > "$WAN_STATUS_FILE"
+    for gw in "${!wan_status[@]}"; do
+        echo "$gw=${wan_status[$gw]}" >> "$WAN_STATUS_FILE"
+    done
+}
+
+declare -A wan_status
+declare -A wan_priority
+
+# Build WAN list sorted by priority as in failover.sh
+tmp_list=()
+for i in "${!WAN[@]}"; do
+    IFS=',' read -r iface gw ord <<< "${WAN[$i]}"
+    wan_priority["$gw"]=$ord
+    tmp_list+=("$ord|$iface|$gw")
+done
+
+IFS=$'\n' sorted=($(sort -n <<<"${tmp_list[*]}"))
+unset IFS
+
+last_primary=""
+
+while true; do
+    primary_found=""
+    for entry in "${sorted[@]}"; do
+        IFS='|' read -r ord iface gw <<< "$entry"
+
+        if check_wan "$iface" "$gw"; then
+            wan_status["$gw"]="up"
+            if [[ -z "$primary_found" ]]; then
+                primary_found="$gw"
+            fi
+            log "INFO" "WAN $iface ($gw) is UP"
+        else
+            wan_status["$gw"]="down"
+            log "WARN" "WAN $iface ($gw) is DOWN"
+        fi
+    done
+
+    write_wan_status
+
+    if [[ "$primary_found" != "$last_primary" ]]; then
+        log "INFO" "Primary WAN changed from $last_primary to $primary_found"
+        last_primary="$primary_found"
+
+        if [[ -x "$FAILOVER_SCRIPT" ]]; then
+            log "INFO" "Running failover script to update routes"
+            "$FAILOVER_SCRIPT"
+        else
+            log "ERROR" "Failover script not found or not executable: $FAILOVER_SCRIPT"
+        fi
+    fi
+
+    sleep 10
+done
